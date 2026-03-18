@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>ScanToNotion</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/tesseract.min.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap');
 
@@ -589,7 +590,7 @@
 
 <header>
   <div class="logo">scan<span>/</span>notion</div>
-  <div style="font-size:12px;color:var(--text-muted);font-family:var(--mono);">v1.4</div>
+  <div style="font-size:12px;color:var(--text-muted);font-family:var(--mono);">v1.5</div>
 </header>
 
 <div class="tabs">
@@ -661,16 +662,6 @@
 
 <!-- ═══════════════ SETTINGS PANEL ═══════════════ -->
 <div class="panel" id="panel-settings">
-  <div class="config-section">
-    <h3>Anthropic API Key</h3>
-    <p style="font-size:12px;color:var(--text-muted);line-height:1.6;margin-bottom:10px;">Used to read your document images. Get one at <span style="color:var(--accent)">console.anthropic.com</span></p>
-    <div class="input-group">
-      <label>API Key</label>
-      <input class="input-field mono" type="password" id="anthropicKey" placeholder="sk-ant-…">
-    </div>
-    <button class="btn btn-secondary" onclick="saveAnthropicKey()" style="margin-bottom:0;">Save Key</button>
-  </div>
-
   <div class="config-section">
     <h3>Notion Integration</h3>
     <div class="input-group">
@@ -841,141 +832,59 @@ function handleFileSelect(file) {
 async function runOCR() {
   if (!currentImageBase64) { statusLog('No image data — aborting'); return; }
 
-  const apiKey = localStorage.getItem('stn_anthropic_key') || '';
-  if (!apiKey) {
-    statusLog('No API key set');
-    showToast('Add your Anthropic API key in Setup tab', 'error');
-    switchTab('settings');
-    return;
-  }
-
-  statusLog('API key found, calling Claude Vision…');
-
   const prog = document.getElementById('progressWrap');
   const bar  = document.getElementById('progressBar');
   const lbl  = document.getElementById('progressLabel');
   prog.classList.add('visible');
-  bar.style.width = '15%';
+  bar.style.width = '5%';
   bar.style.background = 'var(--accent)';
-  lbl.textContent = 'Reading document…';
+  lbl.textContent = 'Loading OCR engine…';
   document.getElementById('notionBtn').disabled = true;
 
-  // Animate bar while waiting
-  const ticker = setInterval(() => {
-    const cur = parseFloat(bar.style.width) || 15;
-    if (cur < 85) bar.style.width = (cur + 3) + '%';
-  }, 400);
-
   try {
-    // Build field list for the prompt
-    const fieldList = rules.length
-      ? rules.map(r => `- ${r.field}`).join('\n')
-      : '(extract all visible text fields)';
+    statusLog('Loading Tesseract…');
 
-    const prompt = `You are an OCR assistant. Extract text from this document image.
+    // Convert base64 back to a blob for Tesseract
+    const byteStr = atob(currentImageBase64);
+    const arr = new Uint8Array(byteStr.length);
+    for (let i = 0; i < byteStr.length; i++) arr[i] = byteStr.charCodeAt(i);
+    const blob = new Blob([arr], { type: currentImageMime });
 
-First, output the complete raw text of the document exactly as it appears, preserving line breaks. Put this inside <raw></raw> tags.
-
-Then extract these specific fields and output them as JSON inside <fields></fields> tags. For each field provide the extracted value as a string, or null if not found:
-${fieldList}
-
-Example output format:
-<raw>
-...full document text...
-</raw>
-<fields>
-{"Field Name": "extracted value", "Other Field": null}
-</fields>
-
-Be precise. Only extract what is actually visible in the document.`;
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-      },
-      body: JSON.stringify({
-        model: 'claude-opus-4-5',
-        max_tokens: 2000,
-        messages: [{
-          role: 'user',
-          content: [
-            {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: currentImageMime,
-                data: currentImageBase64
-              }
-            },
-            { type: 'text', text: prompt }
-          ]
-        }]
-      })
+    const worker = await Tesseract.createWorker('eng', 1, {
+      logger: m => {
+        if (m.status === 'recognizing text') {
+          const pct = Math.round(m.progress * 100);
+          bar.style.width = Math.max(pct, 10) + '%';
+          lbl.textContent = `Recognising… ${pct}%`;
+          statusLog('Recognising… ' + pct + '%');
+        } else if (m.status) {
+          lbl.textContent = m.status;
+          statusLog(m.status);
+          const cur = parseFloat(bar.style.width) || 5;
+          if (cur < 85) bar.style.width = (cur + 2) + '%';
+        }
+      }
     });
 
-    clearInterval(ticker);
-
-    if (!response.ok) {
-      const err = await response.json();
-      throw new Error(err.error?.message || `API error ${response.status}`);
-    }
-
-    statusLog('Response received, parsing…');
-    const data = await response.json();
-    const text = data.content?.[0]?.text || '';
-
-    // Extract raw OCR text
-    const rawMatch = text.match(/<raw>([\s\S]*?)<\/raw>/i);
-    const rawText = rawMatch ? rawMatch[1].trim() : text;
-
-    // Extract fields JSON
-    const fieldsMatch = text.match(/<fields>([\s\S]*?)<\/fields>/i);
-    let aiFields = null;
-    if (fieldsMatch) {
-      try { aiFields = JSON.parse(fieldsMatch[1].trim()); } catch(e) {}
-    }
+    statusLog('Worker ready, recognising…');
+    const result = await worker.recognize(blob);
+    await worker.terminate();
 
     bar.style.width = '100%';
-    lbl.textContent = '✓ Done';
+    lbl.textContent = '✓ OCR complete';
     statusLog('OCR complete ✓');
 
-    // Put raw text in textarea
-    document.getElementById('rawText').value = rawText;
+    const raw = result.data.text;
+    document.getElementById('rawText').value = raw;
     document.getElementById('rawBox').classList.add('visible');
-
-    // Apply regex — but then override with AI-extracted fields where available
     applyRegex();
 
-    if (aiFields) {
-      // Override regex results with AI-extracted values
-      rules.forEach(rule => {
-        const aiVal = aiFields[rule.field];
-        if (aiVal !== null && aiVal !== undefined) {
-          extractedData[rule.field] = String(aiVal);
-          // Update the input in the UI
-          const input = document.querySelector(`[data-field="${CSS.escape(rule.field)}"]`);
-          if (input) {
-            input.value = String(aiVal);
-            input.closest('.field-row').className = 'field-row matched';
-            input.closest('.field-row').querySelector('.badge').className = 'badge ok';
-            input.closest('.field-row').querySelector('.badge').textContent = 'matched';
-          }
-        }
-      });
-      rebuildPayload();
-    }
-
   } catch(err) {
-    clearInterval(ticker);
     bar.style.width = '100%';
     bar.style.background = 'var(--red)';
     lbl.textContent = '✗ Failed: ' + err.message;
     statusLog('ERROR: ' + err.message);
-    showToast('Error: ' + err.message, 'error');
+    showToast('OCR error: ' + err.message, 'error');
     console.error('OCR error:', err);
   }
 }
@@ -1131,14 +1040,9 @@ async function pushToNotion() {
 //  SETTINGS
 // ══════════════════════════════════════════
 function loadSettings() {
-  document.getElementById('anthropicKey').value  = localStorage.getItem('stn_anthropic_key') || '';
-  document.getElementById('notionToken').value   = localStorage.getItem('stn_token') || '';
-  document.getElementById('notionDb').value      = localStorage.getItem('stn_db')    || '';
-  document.getElementById('proxyUrl').value      = localStorage.getItem('stn_proxy') || 'https://corsproxy.io/?url=';
-}
-function saveAnthropicKey() {
-  localStorage.setItem('stn_anthropic_key', document.getElementById('anthropicKey').value.trim());
-  showToast('API key saved', 'success');
+  document.getElementById('notionToken').value = localStorage.getItem('stn_token') || '';
+  document.getElementById('notionDb').value    = localStorage.getItem('stn_db')    || '';
+  document.getElementById('proxyUrl').value    = localStorage.getItem('stn_proxy') || 'https://corsproxy.io/?url=';
 }
 function saveSettings() {
   localStorage.setItem('stn_token', document.getElementById('notionToken').value.trim());
