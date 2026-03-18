@@ -641,8 +641,9 @@
   <div class="config-section">
     <h3>Extraction Rules</h3>
     <p style="font-size:13px;color:var(--text-muted);margin-bottom:16px;line-height:1.6;">
-      Each rule defines a field name and a regex pattern to extract it from the OCR text.
-      Use a capture group <code style="color:var(--accent)">(…)</code> to isolate the value.
+      Each rule can work in two modes: <strong style="color:var(--text)">regex</strong> (from full OCR text)
+      or <strong style="color:var(--text)">template zone</strong> (fixed x/y/w/h area in % of the page).
+      For strict forms, use template zones for higher reliability.
     </p>
     <div id="rulesList"></div>
     <button class="add-rule-btn" onclick="addRule()">+ Add Field Rule</button>
@@ -727,13 +728,52 @@
 let rules = JSON.parse(localStorage.getItem('stn_rules') || '[]');
 let extractedData = {};
 let history = JSON.parse(localStorage.getItem('stn_history') || '[]');
+const OCR_LANGUAGE = 'deu';
+let templateFrame = JSON.parse(localStorage.getItem('stn_frame') || '{"x":"","y":"","w":"","h":""}');
+let autoDetectFrameEnabled = localStorage.getItem('stn_auto_frame') !== '0';
 
 const DEFAULT_RULES = [
-  { field: 'Invoice No', regex: 'Invoice\\s*No[:\\s]+(\\S+)', notionProp: 'Invoice No', notionType: 'title' },
-  { field: 'Date',       regex: 'Date[:\\s]+(\\d{2}[\\/\\-]\\d{2}[\\/\\-]\\d{4})', notionProp: 'Date', notionType: 'rich_text' },
-  { field: 'Total',      regex: 'Total[:\\s]+\\$?([\\d,\\.]+)', notionProp: 'Total', notionType: 'rich_text' },
+  { field: 'Invoice No', regex: 'Invoice\\s*No[:\\s]+(\\S+)', notionProp: 'Invoice No', notionType: 'title', mode: 'regex', x: '', y: '', w: '', h: '' },
+  { field: 'Date',       regex: 'Date[:\\s]+(\\d{2}[\\/\\-]\\d{2}[\\/\\-]\\d{4})', notionProp: 'Date', notionType: 'rich_text', mode: 'regex', x: '', y: '', w: '', h: '' },
+  { field: 'Total',      regex: 'Total[:\\s]+\\$?([\\d,\\.]+)', notionProp: 'Total', notionType: 'rich_text', mode: 'regex', x: '', y: '', w: '', h: '' },
 ];
 if (!rules.length) { rules = DEFAULT_RULES; saveRulesData(); }
+
+function getRuleMode(rule) {
+  return rule?.mode === 'zone' ? 'zone' : 'regex';
+}
+
+function toPct(v) {
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function isZoneRule(rule) {
+  if (getRuleMode(rule) !== 'zone') return false;
+  const x = toPct(rule.x), y = toPct(rule.y), w = toPct(rule.w), h = toPct(rule.h);
+  if (![x, y, w, h].every(Number.isFinite)) return false;
+  if (w <= 0 || h <= 0) return false;
+  return x >= 0 && y >= 0 && x + w <= 100 && y + h <= 100;
+}
+
+function allRulesZoneMode() {
+  return rules.length > 0 && rules.every(isZoneRule);
+}
+
+function isTemplateFrameValid(frame) {
+  const x = toPct(frame?.x), y = toPct(frame?.y), w = toPct(frame?.w), h = toPct(frame?.h);
+  if (![x, y, w, h].every(Number.isFinite)) return false;
+  if (w <= 0 || h <= 0) return false;
+  return x >= 0 && y >= 0 && x + w <= 100 && y + h <= 100;
+}
+
+function saveTemplateFrame() {
+  localStorage.setItem('stn_frame', JSON.stringify(templateFrame || { x: '', y: '', w: '', h: '' }));
+}
+
+function saveAutoFrameSetting() {
+  localStorage.setItem('stn_auto_frame', autoDetectFrameEnabled ? '1' : '0');
+}
 
 // ══════════════════════════════════════════
 //  TABS
@@ -829,6 +869,297 @@ function handleFileSelect(file) {
   reader.readAsDataURL(file);
 }
 
+function base64ToBlob(base64, mimeType) {
+  const byteStr = atob(base64);
+  const arr = new Uint8Array(byteStr.length);
+  for (let i = 0; i < byteStr.length; i++) arr[i] = byteStr.charCodeAt(i);
+  return new Blob([arr], { type: mimeType || 'image/jpeg' });
+}
+
+async function preprocessImageForOCR(base64, mimeType) {
+  const sourceBlob = base64ToBlob(base64, mimeType);
+
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const scale = Math.max(1, Math.min(2.2, 2200 / img.width));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (!ctx) {
+          resolve(sourceBlob);
+          return;
+        }
+
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.filter = 'grayscale(100%) contrast(165%) brightness(108%)';
+        ctx.drawImage(img, 0, 0, w, h);
+        ctx.filter = 'none';
+
+        canvas.toBlob(
+          blob => resolve(blob || sourceBlob),
+          'image/png',
+          1
+        );
+      } catch (e) {
+        reject(e);
+      }
+    };
+    img.onerror = reject;
+    img.src = URL.createObjectURL(sourceBlob);
+  });
+}
+
+function loadImageFromBlob(blob) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(blob);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = err => {
+      URL.revokeObjectURL(url);
+      reject(err);
+    };
+    img.src = url;
+  });
+}
+
+function normalizeOcrText(s) {
+  return (s || '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function detectFrameByProjection(mask, w, h) {
+  const col = new Uint16Array(w);
+  const row = new Uint16Array(h);
+  for (let y = 0; y < h; y++) {
+    const off = y * w;
+    for (let x = 0; x < w; x++) {
+      if (mask[off + x]) {
+        col[x]++;
+        row[y]++;
+      }
+    }
+  }
+
+  const colThr = Math.max(8, Math.round(h * 0.16));
+  const rowThr = Math.max(8, Math.round(w * 0.16));
+
+  let left = -1, right = -1, top = -1, bottom = -1;
+  for (let x = 0; x < w; x++) { if (col[x] >= colThr) { left = x; break; } }
+  for (let x = w - 1; x >= 0; x--) { if (col[x] >= colThr) { right = x; break; } }
+  for (let y = 0; y < h; y++) { if (row[y] >= rowThr) { top = y; break; } }
+  for (let y = h - 1; y >= 0; y--) { if (row[y] >= rowThr) { bottom = y; break; } }
+
+  if (left < 0 || right <= left || top < 0 || bottom <= top) return null;
+  const bw = right - left + 1;
+  const bh = bottom - top + 1;
+  if (bw < w * 0.2 || bh < h * 0.2) return null;
+
+  return { x: left, y: top, w: bw, h: bh, confidence: 0.45 };
+}
+
+async function autoDetectTemplateFrame(blob) {
+  const img = await loadImageFromBlob(blob);
+  const maxSide = 920;
+  const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+  const w = Math.max(1, Math.round(img.width * scale));
+  const h = Math.max(1, Math.round(img.height * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, w, h);
+  const data = ctx.getImageData(0, 0, w, h).data;
+
+  const gray = new Uint8Array(w * h);
+  let sum = 0;
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    const g = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+    gray[p] = g;
+    sum += g;
+  }
+  const mean = sum / gray.length;
+  const thr = Math.max(45, Math.min(140, Math.round(mean * 0.62)));
+
+  const mask = new Uint8Array(w * h);
+  for (let i = 0; i < gray.length; i++) mask[i] = gray[i] < thr ? 1 : 0;
+
+  // Light denoise: keep only dark pixels with at least one dark neighbor.
+  for (let y = 1; y < h - 1; y++) {
+    const off = y * w;
+    for (let x = 1; x < w - 1; x++) {
+      const idx = off + x;
+      if (!mask[idx]) continue;
+      const neighbors =
+        mask[idx - 1] + mask[idx + 1] + mask[idx - w] + mask[idx + w] +
+        mask[idx - w - 1] + mask[idx - w + 1] + mask[idx + w - 1] + mask[idx + w + 1];
+      if (neighbors === 0) mask[idx] = 0;
+    }
+  }
+
+  const visited = new Uint8Array(w * h);
+  const qx = new Int32Array(w * h);
+  const qy = new Int32Array(w * h);
+  let best = null;
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const start = y * w + x;
+      if (!mask[start] || visited[start]) continue;
+
+      let head = 0, tail = 0;
+      qx[tail] = x; qy[tail] = y; tail++;
+      visited[start] = 1;
+
+      let area = 0;
+      let minX = x, maxX = x, minY = y, maxY = y;
+      let touchesBorder = false;
+
+      while (head < tail) {
+        const cx = qx[head], cy = qy[head];
+        head++;
+        area++;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+        if (cx === 0 || cy === 0 || cx === w - 1 || cy === h - 1) touchesBorder = true;
+
+        for (let ny = cy - 1; ny <= cy + 1; ny++) {
+          for (let nx = cx - 1; nx <= cx + 1; nx++) {
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+            const ni = ny * w + nx;
+            if (!mask[ni] || visited[ni]) continue;
+            visited[ni] = 1;
+            qx[tail] = nx;
+            qy[tail] = ny;
+            tail++;
+          }
+        }
+      }
+
+      const bw = maxX - minX + 1;
+      const bh = maxY - minY + 1;
+      const boxArea = bw * bh;
+      const boxNorm = boxArea / (w * h);
+      if (boxNorm < 0.08) continue;
+      if (bw < w * 0.2 || bh < h * 0.2) continue;
+
+      const fill = area / boxArea;
+      if (fill > 0.45) continue;
+
+      const aspect = Math.min(bw / bh, bh / bw);
+      const score = (boxNorm * 2.2) + (1 - fill) + (aspect * 0.4) + (touchesBorder ? -0.25 : 0);
+
+      if (!best || score > best.score) {
+        best = { x: minX, y: minY, w: bw, h: bh, score, confidence: Math.max(0.5, Math.min(0.95, score / 3)) };
+      }
+    }
+  }
+
+  const candidate = best || detectFrameByProjection(mask, w, h);
+  if (!candidate) return null;
+
+  const framePct = {
+    x: Math.round((candidate.x / w) * 10000) / 100,
+    y: Math.round((candidate.y / h) * 10000) / 100,
+    w: Math.round((candidate.w / w) * 10000) / 100,
+    h: Math.round((candidate.h / h) * 10000) / 100,
+    confidence: candidate.confidence || 0.5,
+    source: 'auto'
+  };
+
+  return isTemplateFrameValid(framePct) ? framePct : null;
+}
+
+async function runZoneOCR(worker, blob, zoneRules, onProgress, activeFrame) {
+  const img = await loadImageFromBlob(blob);
+  const base = document.createElement('canvas');
+  base.width = img.width;
+  base.height = img.height;
+  const bctx = base.getContext('2d', { willReadFrequently: true });
+  bctx.drawImage(img, 0, 0);
+
+  let framePx = { x: 0, y: 0, w: base.width, h: base.height };
+  if (isTemplateFrameValid(activeFrame)) {
+    const fx = Math.round((toPct(activeFrame.x) / 100) * base.width);
+    const fy = Math.round((toPct(activeFrame.y) / 100) * base.height);
+    const fw = Math.max(1, Math.round((toPct(activeFrame.w) / 100) * base.width));
+    const fh = Math.max(1, Math.round((toPct(activeFrame.h) / 100) * base.height));
+    framePx = { x: fx, y: fy, w: fw, h: fh };
+  }
+
+  const values = {};
+  const traces = [];
+
+  for (let i = 0; i < zoneRules.length; i++) {
+    const rule = zoneRules[i];
+    const xPct = toPct(rule.x), yPct = toPct(rule.y), wPct = toPct(rule.w), hPct = toPct(rule.h);
+
+    const x = framePx.x + Math.round((xPct / 100) * framePx.w);
+    const y = framePx.y + Math.round((yPct / 100) * framePx.h);
+    const w = Math.max(1, Math.round((wPct / 100) * framePx.w));
+    const h = Math.max(1, Math.round((hPct / 100) * framePx.h));
+
+    const zoneCanvas = document.createElement('canvas');
+    zoneCanvas.width = w;
+    zoneCanvas.height = h;
+    const zctx = zoneCanvas.getContext('2d', { willReadFrequently: true });
+    zctx.filter = 'grayscale(100%) contrast(175%) brightness(110%)';
+    zctx.drawImage(base, x, y, w, h, 0, 0, w, h);
+    zctx.filter = 'none';
+
+    const zonePSM = /\s/.test(rule.field || '') ? '7' : '8';
+    await worker.setParameters({ tessedit_pageseg_mode: zonePSM });
+    const zoneResult = await worker.recognize(zoneCanvas);
+    const text = normalizeOcrText(zoneResult?.data?.text || '');
+    const conf = Number.isFinite(zoneResult?.data?.confidence) ? Math.round(zoneResult.data.confidence) : null;
+
+    values[rule.field] = text;
+    traces.push({
+      field: rule.field,
+      mode: 'zone',
+      regex: rule.regex || '',
+      notionProp: rule.notionProp || rule.field,
+      notionType: rule.notionType || 'rich_text',
+      matched: !!text,
+      value: text,
+      fullMatch: '',
+      groups: [],
+      error: null,
+      zone: { x: xPct, y: yPct, w: wPct, h: hPct },
+      frame: isTemplateFrameValid(activeFrame) ? {
+        x: toPct(activeFrame.x), y: toPct(activeFrame.y), w: toPct(activeFrame.w), h: toPct(activeFrame.h)
+      } : null,
+      frameSource: activeFrame?.source || (isTemplateFrameValid(activeFrame) ? 'manual' : null),
+      confidence: conf
+    });
+
+    if (typeof onProgress === 'function') {
+      onProgress(Math.round(((i + 1) / zoneRules.length) * 100), rule.field);
+    }
+  }
+
+  const syntheticRaw = zoneRules
+    .map(r => `${r.field}: ${values[r.field] || ''}`)
+    .join('\n');
+
+  return { values, traces, rawText: syntheticRaw };
+}
+
 async function runOCR() {
   if (!currentImageBase64) { statusLog('No image data — aborting'); return; }
 
@@ -843,21 +1174,24 @@ async function runOCR() {
 
   try {
     statusLog('Loading Tesseract…');
+    statusLog('OCR language: German (deu)');
+    const zoneModeActive = allRulesZoneMode();
+    statusLog(zoneModeActive ? 'Extraction mode: template zones' : 'Extraction mode: regex from full text');
 
-    // Convert base64 back to a blob for Tesseract
-    const byteStr = atob(currentImageBase64);
-    const arr = new Uint8Array(byteStr.length);
-    for (let i = 0; i < byteStr.length; i++) arr[i] = byteStr.charCodeAt(i);
-    const blob = new Blob([arr], { type: currentImageMime });
+    lbl.textContent = 'Optimising image…';
+    statusLog('Preprocessing image for OCR…');
+    const blob = await preprocessImageForOCR(currentImageBase64, currentImageMime);
 
-    const worker = await Tesseract.createWorker('eng', 1, {
+    let lastLoggedStatus = '';
+
+    const worker = await Tesseract.createWorker(OCR_LANGUAGE, 1, {
       logger: m => {
         if (m.status === 'recognizing text') {
           const pct = Math.round(m.progress * 100);
-          bar.style.width = Math.max(pct, 10) + '%';
-          lbl.textContent = `Recognising… ${pct}%`;
-          statusLog('Recognising… ' + pct + '%');
-        } else if (m.status) {
+          if (!zoneModeActive) bar.style.width = Math.max(pct, 10) + '%';
+          lbl.textContent = 'Recognising…';
+        } else if (m.status && m.status !== lastLoggedStatus) {
+          lastLoggedStatus = m.status;
           lbl.textContent = m.status;
           statusLog(m.status);
           const cur = parseFloat(bar.style.width) || 5;
@@ -866,18 +1200,58 @@ async function runOCR() {
       }
     });
 
-    statusLog('Worker ready, recognising…');
-    const result = await worker.recognize(blob);
+    await worker.setParameters({
+      tessedit_pageseg_mode: '6',
+      preserve_interword_spaces: '1',
+      user_defined_dpi: '300'
+    });
+
+    let raw = '';
+
+    if (zoneModeActive) {
+      let activeFrame = isTemplateFrameValid(templateFrame) ? { ...templateFrame, source: 'manual' } : null;
+      if (autoDetectFrameEnabled) {
+        statusLog('Detecting frame automatically…');
+        const detected = await autoDetectTemplateFrame(blob);
+        if (detected) {
+          activeFrame = detected;
+          statusLog(`Auto frame detected: x=${detected.x} y=${detected.y} w=${detected.w} h=${detected.h}`);
+        } else if (activeFrame) {
+          statusLog('Auto frame not found, using manual frame');
+        } else {
+          statusLog('Auto frame not found, using full page');
+        }
+      }
+
+      statusLog('Worker ready, reading fixed zones…');
+      lbl.textContent = 'Recognising fixed zones…';
+      const zoneRules = rules.filter(isZoneRule);
+      const zoneResult = await runZoneOCR(worker, blob, zoneRules, (pct, field) => {
+        bar.style.width = Math.max(10, pct) + '%';
+        lbl.textContent = `Recognising ${field}…`;
+      }, activeFrame);
+      extractedData = { ...zoneResult.values };
+      lastTrace = zoneResult.traces;
+      raw = zoneResult.rawText;
+      document.getElementById('rawText').value = raw;
+      document.getElementById('rawBox').classList.add('visible');
+      renderExtractedFromCurrentData();
+      rebuildPayload();
+      document.getElementById('notionBtn').disabled = rules.length === 0;
+    } else {
+      statusLog('Worker ready, recognising…');
+      const result = await worker.recognize(blob);
+      raw = result.data.text;
+      document.getElementById('rawText').value = raw;
+      document.getElementById('rawBox').classList.add('visible');
+      applyRegex();
+    }
+
     await worker.terminate();
 
     bar.style.width = '100%';
     lbl.textContent = '✓ OCR complete';
     statusLog('OCR complete ✓');
-
-    const raw = result.data.text;
-    document.getElementById('rawText').value = raw;
-    document.getElementById('rawBox').classList.add('visible');
-    applyRegex();
 
   } catch(err) {
     bar.style.width = '100%';
@@ -895,17 +1269,48 @@ async function runOCR() {
 let lastTrace = [];   // stores per-rule debug info
 let lastPayload = null;
 
-function applyRegex() {
-  const text = document.getElementById('rawText').value;
-  if (!text.trim()) return;
-
-  extractedData = {};
-  lastTrace = [];
+function renderExtractedFromCurrentData() {
   const container = document.getElementById('extractedFields');
   container.innerHTML = `<div class="section-label" style="margin-top:16px;">Extracted Fields — tap to edit</div><div class="fields-grid" id="fieldsGrid"></div>`;
   const grid = document.getElementById('fieldsGrid');
 
   rules.forEach(rule => {
+    const value = extractedData[rule.field] || '';
+    const trace = lastTrace.find(t => t.field === rule.field);
+    const matched = !!trace?.matched || !!value;
+
+    grid.innerHTML += `
+      <div class="field-row ${matched ? 'matched' : 'unmatched'}">
+        <div class="field-name">
+          ${rule.field}
+          <span class="badge ${matched ? 'ok' : 'miss'}">${matched ? 'matched' : 'no match'}</span>
+        </div>
+        <input class="field-value" data-field="${rule.field}"
+          value="${escHtml(value)}"
+          placeholder="— not found, enter manually —"
+          oninput="extractedData['${rule.field}'] = this.value; rebuildPayload();">
+      </div>`;
+  });
+}
+
+function applyRegex() {
+  if (allRulesZoneMode()) {
+    showToast('Rules are in template-zone mode. Scan again to re-run zone OCR.', 'error');
+    return;
+  }
+
+  const text = document.getElementById('rawText').value;
+  if (!text.trim()) return;
+
+  extractedData = {};
+  lastTrace = [];
+
+  rules.forEach(rule => {
+    if (getRuleMode(rule) !== 'regex') {
+      extractedData[rule.field] = extractedData[rule.field] || '';
+      return;
+    }
+
     let value = '';
     let matched = false;
     let regexError = null;
@@ -937,19 +1342,9 @@ function applyRegex() {
       groups: rawMatch ? [...rawMatch].slice(1) : [],
       error: regexError
     });
-
-    grid.innerHTML += `
-      <div class="field-row ${matched ? 'matched' : 'unmatched'}">
-        <div class="field-name">
-          ${rule.field}
-          <span class="badge ${matched ? 'ok' : 'miss'}">${matched ? 'matched' : 'no match'}</span>
-        </div>
-        <input class="field-value" data-field="${rule.field}"
-          value="${escHtml(value)}"
-          placeholder="— not found, enter manually —"
-          oninput="extractedData['${rule.field}'] = this.value; rebuildPayload();">
-      </div>`;
   });
+
+  renderExtractedFromCurrentData();
 
   rebuildPayload();
   document.getElementById('notionBtn').disabled = rules.length === 0;
@@ -981,7 +1376,12 @@ function rebuildPayload() {
   lastPayload = { parent: { database_id: dbId }, properties };
 }
 
-function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
+function escHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/"/g,'&quot;');
+}
 
 // ══════════════════════════════════════════
 //  NOTION PUSH
@@ -1069,8 +1469,33 @@ async function testNotion() {
 // ══════════════════════════════════════════
 function renderRules() {
   const list = document.getElementById('rulesList');
-  list.innerHTML = '';
+  list.innerHTML = `
+    <div class="rule-card" style="border-color:rgba(200,240,96,0.35)">
+      <div class="rule-card-header">
+        <div class="rule-card-title">Template Frame (for all zone rules)</div>
+      </div>
+      <div class="input-group">
+        <label>Frame in % of page: X, Y, W, H</label>
+        <div class="rule-row">
+          <input class="input-field mono" value="${escHtml(String(templateFrame.x ?? ''))}" onchange="templateFrame.x=this.value">
+          <input class="input-field mono" value="${escHtml(String(templateFrame.y ?? ''))}" onchange="templateFrame.y=this.value">
+          <input class="input-field mono" value="${escHtml(String(templateFrame.w ?? ''))}" onchange="templateFrame.w=this.value">
+          <input class="input-field mono" value="${escHtml(String(templateFrame.h ?? ''))}" onchange="templateFrame.h=this.value">
+        </div>
+      </div>
+      <div class="input-group" style="margin-bottom:6px;">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" ${autoDetectFrameEnabled ? 'checked' : ''} onchange="autoDetectFrameEnabled=this.checked">
+          Auto-detect frame on every scan
+        </label>
+      </div>
+      <div style="font-size:11px;color:var(--text-muted);line-height:1.6;">
+        Auto mode tries to find the printed frame automatically.<br>
+        If detection fails, manual frame values are used; if empty, full page is used.
+      </div>
+    </div>`;
   rules.forEach((r, i) => {
+    const mode = getRuleMode(r);
     list.innerHTML += `
       <div class="rule-card">
         <div class="rule-card-header">
@@ -1084,6 +1509,24 @@ function renderRules() {
         <div class="input-group">
           <label>Regex Pattern (use capture group)</label>
           <input class="input-field mono" value="${escHtml(r.regex)}" onchange="rules[${i}].regex=this.value" placeholder="e.g. Total[:\\s]+\\$?([\\d,\\.]+)">
+        </div>
+        <div class="rule-row">
+          <div class="input-group" style="flex:1">
+            <label>Extraction Mode</label>
+            <select class="input-field" onchange="rules[${i}].mode=this.value">
+              <option value="regex" ${mode==='regex' ? 'selected':''}>regex</option>
+              <option value="zone" ${mode==='zone' ? 'selected':''}>template zone</option>
+            </select>
+          </div>
+        </div>
+        <div class="input-group">
+          <label>Zone (percent of page): X, Y, W, H</label>
+          <div class="rule-row">
+            <input class="input-field mono" value="${escHtml(String(r.x ?? ''))}" onchange="rules[${i}].x=this.value" placeholder="x %">
+            <input class="input-field mono" value="${escHtml(String(r.y ?? ''))}" onchange="rules[${i}].y=this.value" placeholder="y %">
+            <input class="input-field mono" value="${escHtml(String(r.w ?? ''))}" onchange="rules[${i}].w=this.value" placeholder="w %">
+            <input class="input-field mono" value="${escHtml(String(r.h ?? ''))}" onchange="rules[${i}].h=this.value" placeholder="h %">
+          </div>
         </div>
         <div class="rule-row">
           <div class="input-group" style="flex:1">
@@ -1104,7 +1547,7 @@ function renderRules() {
   });
 }
 function addRule() {
-  rules.push({ field: 'New Field', regex: '', notionProp: 'New Field', notionType: 'rich_text' });
+  rules.push({ field: 'New Field', regex: '', notionProp: 'New Field', notionType: 'rich_text', mode: 'zone', x: '', y: '', w: '', h: '' });
   renderRules();
 }
 function deleteRule(i) {
@@ -1112,7 +1555,22 @@ function deleteRule(i) {
   renderRules();
 }
 function saveRules() { saveRulesData(); showToast('Rules saved', 'success'); }
-function saveRulesData() { localStorage.setItem('stn_rules', JSON.stringify(rules)); }
+function saveRulesData() {
+  rules = rules.map(r => ({
+    field: r.field || 'Field',
+    regex: r.regex || '',
+    notionProp: r.notionProp || r.field || 'Field',
+    notionType: r.notionType || 'rich_text',
+    mode: getRuleMode(r),
+    x: r.x ?? '',
+    y: r.y ?? '',
+    w: r.w ?? '',
+    h: r.h ?? ''
+  }));
+  localStorage.setItem('stn_rules', JSON.stringify(rules));
+  saveTemplateFrame();
+  saveAutoFrameSetting();
+}
 
 // ══════════════════════════════════════════
 //  HISTORY
@@ -1185,6 +1643,7 @@ function renderDebug() {
     const cls   = t.error ? 'warn' : t.matched ? 'ok' : 'err';
     const stLbl = t.error ? 'regex error' : t.matched ? 'matched' : 'no match';
     const stCls = t.error ? 'warn' : t.matched ? 'ok' : 'err';
+    const isZone = t.mode === 'zone';
 
     html += `
       <div class="trace-card ${cls}">
@@ -1194,9 +1653,37 @@ function renderDebug() {
         </div>
         <div class="trace-body" id="trace-body-${i}">
           <div class="trace-row">
-            <div class="trace-key">pattern</div>
-            <div class="trace-val dim">${escHtml(t.regex || '(empty)')}</div>
+            <div class="trace-key">mode</div>
+            <div class="trace-val dim">${isZone ? 'template zone' : 'regex'}</div>
           </div>`;
+
+    if (isZone && t.zone) {
+      if (t.frame) {
+        html += `<div class="trace-row">
+          <div class="trace-key">frame %</div>
+          <div class="trace-val dim">x:${t.frame.x}, y:${t.frame.y}, w:${t.frame.w}, h:${t.frame.h}</div>
+        </div>`;
+        html += `<div class="trace-row">
+          <div class="trace-key">frame src</div>
+          <div class="trace-val dim">${escHtml(t.frameSource || 'manual')}</div>
+        </div>`;
+      }
+      html += `<div class="trace-row">
+        <div class="trace-key">zone %</div>
+        <div class="trace-val dim">x:${t.zone.x}, y:${t.zone.y}, w:${t.zone.w}, h:${t.zone.h}</div>
+      </div>`;
+      html += `<div class="trace-row">
+        <div class="trace-key">confidence</div>
+        <div class="trace-val ${t.confidence >= 70 ? 'ok' : 'err'}">${t.confidence ?? 'n/a'}</div>
+      </div>`;
+    }
+
+    if (!isZone) {
+      html += `<div class="trace-row">
+        <div class="trace-key">pattern</div>
+        <div class="trace-val dim">${escHtml(t.regex || '(empty)')}</div>
+      </div>`;
+    }
 
     if (t.error) {
       html += `<div class="trace-row">
@@ -1205,15 +1692,15 @@ function renderDebug() {
       </div>`;
     } else if (t.matched) {
       html += `
-          <div class="trace-row">
+          ${!isZone ? `<div class="trace-row">
             <div class="trace-key">full match</div>
             <div class="trace-val dim">${escHtml(t.fullMatch)}</div>
-          </div>
+          </div>` : ''}
           <div class="trace-row">
             <div class="trace-key">captured</div>
             <div class="trace-val ok">${escHtml(t.value)}</div>
           </div>`;
-      if (t.groups.length > 1) {
+      if (!isZone && t.groups.length > 1) {
         html += `<div class="trace-row">
           <div class="trace-key">all groups</div>
           <div class="trace-val dim">${t.groups.map((g,gi) => `[${gi+1}] ${escHtml(g||'')}`).join('  ')}</div>
